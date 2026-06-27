@@ -1,7 +1,13 @@
+// ============================================================
+//  media_control.h  –  NimBLE HID Consumer Media Keys
+//  Pin 27 = Previous | Pin 26 = Play/Pause | Pin 25 = Next
+//  Logic : INPUT_PULLDOWN, rising-edge (LOW->HIGH) detection
+// ============================================================
 #ifndef MEDIA_CONTROL_H
 #define MEDIA_CONTROL_H
 
-#include <BleKeyboard.h>
+#include <Arduino.h>
+#include <NimBLECharacteristic.h>
 
 // ── Pin Definitions ──────────────────────────────────────────
 const int Prev_Button      = 27;
@@ -9,50 +15,72 @@ const int PlayPause_Button = 26;
 const int Next_Button      = 25;
 
 // ── Debounce States ──────────────────────────────────────────
-bool prevState      = LOW;
-bool playPauseState = LOW;
-bool nextState      = LOW;
+static bool prevState      = LOW;
+static bool playPauseState = LOW;
+static bool nextState      = LOW;
 
-// ── Function ─────────────────────────────────────────────────
-void handleMediaControl(BleKeyboard &bleKeyboard) {
+// ── HID Consumer Usage IDs (Usage Page 0x0C) ─────────────────
+#define HID_CONSUMER_NEXT_TRACK   0x00B5
+#define HID_CONSUMER_PREV_TRACK   0x00B6
+#define HID_CONSUMER_PLAY_PAUSE   0x00CD
+#define HID_CONSUMER_RELEASE      0x0000
 
-  bool currentPrev      = digitalRead(Prev_Button);
-  bool currentPlayPause = digitalRead(PlayPause_Button);
-  bool currentNext      = digitalRead(Next_Button);
+// ── Extern (defined in main.cpp) ─────────────────────────────
+extern NimBLECharacteristic* mediaInputChar;
 
-  // Previous Track
-  if (currentPrev == HIGH && prevState == LOW) {
-    Serial.println("Previous Track");
-    bleKeyboard.write(KEY_MEDIA_PREVIOUS_TRACK);
-    delay(50);
-  }
+// ── Send key-down then key-up ────────────────────────────────
+inline void sendMediaKey(uint16_t usage) {
+  if (!mediaInputChar) return;
 
-  // Play/Pause
-  if (currentPlayPause == HIGH && playPauseState == LOW) {
-    Serial.println("Play/Pause");
-    bleKeyboard.write(KEY_MEDIA_PLAY_PAUSE);
-    delay(50);
-  }
+  uint8_t report[2];
 
-  // Next Track
-  if (currentNext == HIGH && nextState == LOW) {
-    Serial.println("Next Track");
-    bleKeyboard.write(KEY_MEDIA_NEXT_TRACK);
-    delay(50);
-  }
+  // Key down
+  report[0] = usage & 0xFF;
+  report[1] = (usage >> 8) & 0xFF;
+  mediaInputChar->setValue(report, 2);
+  mediaInputChar->notify();
+  delay(50);
 
-  // Save states
-  prevState      = currentPrev;
-  playPauseState = currentPlayPause;
-  nextState      = currentNext;
+  // Key up
+  report[0] = 0x00;
+  report[1] = 0x00;
+  mediaInputChar->setValue(report, 2);
+  mediaInputChar->notify();
+  delay(20);
 }
 
-// ── Setup Function ───────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────
 void setupMediaPins() {
   pinMode(Prev_Button,      INPUT_PULLDOWN);
   pinMode(PlayPause_Button, INPUT_PULLDOWN);
   pinMode(Next_Button,      INPUT_PULLDOWN);
   Serial.println("Media Control Pins Initialized");
+}
+
+// ── Handler – call every loop() ──────────────────────────────
+void handleMediaControl() {
+  bool currentPrev      = digitalRead(Prev_Button);
+  bool currentPlayPause = digitalRead(PlayPause_Button);
+  bool currentNext      = digitalRead(Next_Button);
+
+  if (prevState == LOW && currentPrev == HIGH) {
+    Serial.println("Previous Track");
+    sendMediaKey(HID_CONSUMER_PREV_TRACK);
+  }
+
+  if (playPauseState == LOW && currentPlayPause == HIGH) {
+    Serial.println("Play/Pause");
+    sendMediaKey(HID_CONSUMER_PLAY_PAUSE);
+  }
+
+  if (nextState == LOW && currentNext == HIGH) {
+    Serial.println("Next Track");
+    sendMediaKey(HID_CONSUMER_NEXT_TRACK);
+  }
+
+  prevState      = currentPrev;
+  playPauseState = currentPlayPause;
+  nextState      = currentNext;
 }
 
 #endif // MEDIA_CONTROL_H
