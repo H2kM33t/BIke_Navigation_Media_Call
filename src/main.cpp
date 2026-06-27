@@ -1,9 +1,5 @@
 // ============================================================
-//  main.cpp  –  ESP32 BLE HID (NimBLE-Arduino v2.x)
-//  Fix : Nothing Phone (EvolutionX) + Samsung One UI 7
-//
-//  platformio.ini lib_deps:
-//    h2zero/NimBLE-Arduino @ ^2.5.0
+//  main.cpp  –  ESP32 NimBLE HID + OLED + Beeline Nav UI
 // ============================================================
 #include <Arduino.h>
 #include <NimBLEDevice.h>
@@ -13,6 +9,8 @@
 
 #include "media_control.h"
 #include "call_control.h"
+#include "display.h"
+#include "navigation.h"
 
 // ── HID Report IDs ───────────────────────────────────────────
 #define REPORT_ID_CONSUMER 0x01
@@ -30,37 +28,31 @@ NimBLECharacteristic *navChar = nullptr;
 bool deviceConnected = false;
 bool wasConnected = false;
 
+// ── Screen toggle ─────────────────────────────────────────────
+// Long press Play/Pause (pin 26) > 800ms = switch screen
+enum Screen
+{
+  SCREEN_MEDIA,
+  SCREEN_NAV
+};
+Screen currentScreen = SCREEN_MEDIA;
+unsigned long ppHeldAt = 0;
+bool ppWasHeld = false;
+
 // ── HID Report Descriptor ────────────────────────────────────
 static const uint8_t hidReportDescriptor[] = {
-
-    // Consumer Control – array style, 2-byte usage ID
-    0x05, 0x0C,               // Usage Page (Consumer)
-    0x09, 0x01,               // Usage (Consumer Control)
-    0xA1, 0x01,               // Collection (Application)
-    0x85, REPORT_ID_CONSUMER, //   Report ID 1
-    0x15, 0x00,               //   Logical Minimum (0)
-    0x26, 0xFF, 0x03,         //   Logical Maximum (1023)
-    0x19, 0x00,               //   Usage Minimum (0)
-    0x2A, 0xFF, 0x03,         //   Usage Maximum (1023)
-    0x75, 0x10,               //   Report Size (16 bit)
-    0x95, 0x01,               //   Report Count (1)
-    0x81, 0x00,               //   Input (Data, Array, Absolute)
-    0xC0,                     // End Collection
-
-    // Telephony Device – array style, 2-byte usage ID
-    0x05, 0x0B,                // Usage Page (Telephony)
-    0x09, 0x01,                // Usage (Phone)
-    0xA1, 0x01,                // Collection (Application)
-    0x85, REPORT_ID_TELEPHONY, //   Report ID 2
-    0x15, 0x00,                //   Logical Minimum (0)
-    0x26, 0xFF, 0x03,          //   Logical Maximum (1023)
-    0x19, 0x00,                //   Usage Minimum (0)
-    0x2A, 0xFF, 0x03,          //   Usage Maximum (1023)
-    0x75, 0x10,                //   Report Size (16 bit)
-    0x95, 0x01,                //   Report Count (1)
-    0x81, 0x00,                //   Input (Data, Array, Absolute)
-    0xC0                       // End Collection
-};
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01,
+    0x85, REPORT_ID_CONSUMER,
+    0x15, 0x00, 0x26, 0xFF, 0x03,
+    0x19, 0x00, 0x2A, 0xFF, 0x03,
+    0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
+    0xC0,
+    0x05, 0x0B, 0x09, 0x01, 0xA1, 0x01,
+    0x85, REPORT_ID_TELEPHONY,
+    0x15, 0x00, 0x26, 0xFF, 0x03,
+    0x19, 0x00, 0x2A, 0xFF, 0x03,
+    0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
+    0xC0};
 
 // ── Server Callbacks ──────────────────────────────────────────
 class ServerCallbacks : public NimBLEServerCallbacks
@@ -79,7 +71,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
   }
 };
 
-// ── Beeline Nav Write Callback ────────────────────────────────
+// ── Nav Write Callback ────────────────────────────────────────
 class NavCallbacks : public NimBLECharacteristicCallbacks
 {
   void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo &connInfo) override
@@ -94,23 +86,47 @@ class NavCallbacks : public NimBLECharacteristicCallbacks
   }
 };
 
+// ── Screen toggle handler ─────────────────────────────────────
+void handleScreenToggle()
+{
+  bool ppPressed = digitalRead(PlayPause_Button); // pin 26 from media_control.h
+
+  if (ppPressed == HIGH)
+  {
+    if (ppHeldAt == 0)
+      ppHeldAt = millis();
+    if (!ppWasHeld && (millis() - ppHeldAt > 800))
+    {
+      // Long press detected – toggle screen
+      currentScreen = (currentScreen == SCREEN_MEDIA) ? SCREEN_NAV : SCREEN_MEDIA;
+      Serial.println(currentScreen == SCREEN_NAV ? "Screen: NAV" : "Screen: MEDIA");
+      ppWasHeld = true;
+    }
+  }
+  else
+  {
+    ppHeldAt = 0;
+    ppWasHeld = false;
+  }
+}
+
 // ── Setup ─────────────────────────────────────────────────────
 void setup()
 {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ESP32 NimBLE HID + Nav ===");
+  Serial.println("\n=== ESP32 NimBLE HID + OLED Nav ===");
 
+  setupDisplay();
   setupMediaPins();
   setupCallPins();
 
   NimBLEDevice::init("ESP32 Bike Control");
-  NimBLEDevice::setPower(3);
+  NimBLEDevice::setPower(9);
 
   NimBLEServer *pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
-  // ── HID Device ───────────────────────────────────────────
   NimBLEHIDDevice *hid = new NimBLEHIDDevice(pServer);
   hid->setManufacturer("ESP32");
   hid->setPnp(0x02, 0x045E, 0x0000, 0x0110);
@@ -122,7 +138,6 @@ void setup()
 
   NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND);
 
-  // ── Beeline Navigation GATT Service ──────────────────────
   NimBLEService *navSvc = pServer->createService(NAV_SERVICE_UUID);
   navChar = navSvc->createCharacteristic(
       NAV_CHAR_UUID,
@@ -131,7 +146,6 @@ void setup()
 
   pServer->start();
 
-  // ── Advertising (Nothing Phone + Samsung One UI 7 fix) ───
   NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
   pAdv->addServiceUUID(hid->getHidService()->getUUID());
   pAdv->addServiceUUID(NAV_SERVICE_UUID);
@@ -150,6 +164,20 @@ void setup()
 // ── Loop ──────────────────────────────────────────────────────
 void loop()
 {
+
+  // Screen toggle – always active
+  handleScreenToggle();
+
+  // Draw active screen
+  if (currentScreen == SCREEN_NAV)
+  {
+    handleNavigation();
+  }
+  else
+  {
+    handleDisplay(deviceConnected);
+  }
+
   if (!deviceConnected)
   {
     if (wasConnected)
@@ -157,7 +185,7 @@ void loop()
       wasConnected = false;
       Serial.println("Waiting for BLE connection...");
     }
-    delay(500);
+    delay(20);
     return;
   }
 
