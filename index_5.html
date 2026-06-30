@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Vinrox Bike Console</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:sans-serif;background:#111;color:#eee;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+  #statusbar{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#1a1a1a;border-bottom:1px solid #333;flex-shrink:0;min-height:48px}
+  #ble-btn{padding:6px 14px;border-radius:20px;border:none;font-size:13px;font-weight:600;cursor:pointer;background:#2a6eff;color:#fff;transition:background .2s}
+  #ble-btn.connected{background:#1db954}
+  #ble-btn.error{background:#c0392b}
+  #ble-status{font-size:12px;color:#aaa;flex:1}
+  #gps-dot{width:8px;height:8px;border-radius:50%;background:#555;flex-shrink:0}
+  #gps-dot.active{background:#1db954}
+  #navbar{display:none;align-items:center;gap:12px;padding:8px 14px;background:#1e1e1e;border-bottom:1px solid #333;flex-shrink:0}
+  #navbar.visible{display:flex}
+  #nav-arrow{font-size:32px;line-height:1;min-width:36px;text-align:center}
+  #nav-dist{font-size:22px;font-weight:700;color:#fff;min-width:70px}
+  #nav-street{font-size:13px;color:#bbb;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #nav-eta{font-size:12px;color:#888;text-align:right;min-width:60px}
+  #map{flex:1;min-height:0}
+  #searchbar{display:flex;gap:8px;padding:8px 14px;background:#1a1a1a;border-top:1px solid #333;flex-shrink:0}
+  #dest-input{flex:1;padding:8px 12px;border-radius:20px;border:1px solid #444;background:#2a2a2a;color:#eee;font-size:14px;outline:none}
+  #dest-input:focus{border-color:#2a6eff}
+  #search-btn{padding:8px 16px;border-radius:20px;border:none;background:#2a6eff;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
+  #clear-btn{padding:8px 12px;border-radius:20px;border:none;background:#333;color:#aaa;font-size:14px;cursor:pointer;display:none}
+  #clear-btn.visible{display:block}
+  #toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%) translateY(20px);background:#333;color:#fff;padding:8px 18px;border-radius:20px;font-size:13px;opacity:0;transition:opacity .3s,transform .3s;pointer-events:none;z-index:9999;white-space:nowrap}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .leaflet-container{background:#242424}
+  .fake-gps-marker{width:20px;height:20px;border-radius:50%;background:#2a6eff;border:3px solid #fff;box-shadow:0 0 0 3px rgba(42,110,255,.25),0 2px 10px rgba(0,0,0,.35);cursor:grab}
+  .fake-gps-marker:active{cursor:grabbing}
+</style>
+</head>
+<body>
+
+<div id="statusbar">
+  <button id="ble-btn" onclick="toggleBLE()">Connect BLE</button>
+  <span id="ble-status">Not connected</span>
+  <div id="gps-dot" title="GPS"></div>
+</div>
+
+<div id="navbar">
+  <div id="nav-arrow">&#8593;</div>
+  <div id="nav-dist">--</div>
+  <div id="nav-street">Calculating...</div>
+  <div id="nav-eta">--</div>
+</div>
+
+<div id="map"></div>
+
+<div id="searchbar">
+  <input id="dest-input" type="text" placeholder="Search destination..." autocomplete="off"/>
+  <button id="search-btn" onclick="searchDestination()">Go</button>
+  <button id="clear-btn" onclick="clearRoute()">Clear</button>
+</div>
+
+<div id="toast"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// BLE UUIDs -- must match main.cpp
+const NAV_SERVICE = '12345678-1234-1234-1234-123456789abc';
+const NAV_CHAR    = 'abcdefab-cdef-cdef-cdef-abcdefabcdef';
+
+// TurnDir values -- must match navigation.h enum order
+const TURN_STRAIGHT     = 0;
+const TURN_LEFT         = 1;
+const TURN_RIGHT        = 2;
+const TURN_SLIGHT_LEFT  = 3;
+const TURN_SLIGHT_RIGHT = 4;
+const TURN_U_TURN       = 5;
+
+const TURN_ARROWS = ['&#8593;','&#8592;','&#8594;','&#8598;','&#8599;','&#8626;'];
+const OSRM_BASE   = 'https://router.project-osrm.org/route/v1/driving/';
+const USE_STILL_RANDOM_GPS = true; // Testing mode: fixed random start point.
+const FAKE_GPS_CENTER = {lat:22.3072,lng:73.1812};
+const FAKE_GPS_RADIUS_METRES = 2500;
+
+// State
+let bleDevice=null, bleChar=null;
+let map, userMarker, destMarker, routeLine;
+let userPos=null, destPos=null;
+let routeSteps=[], currentStepIdx=0;
+let navInterval=null;
+let fakeGpsPos=null;
+let routeRefreshTimer=null;
+const fakeGpsIcon=L.divIcon({className:'',html:'<div class="fake-gps-marker"></div>',iconSize:[20,20],iconAnchor:[10,10]});
+
+// Map
+function initMap(){
+  map=L.map('map',{zoomControl:true,attributionControl:false});
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,crossOrigin:true,referrerPolicy:'no-referrer'}).addTo(map);
+  map.setView([22.3072,73.1812],13);
+  map.on('click',function(e){ if(!destPos) setDestination(e.latlng); });
+}
+
+// GPS
+function startGPS(){
+  if(USE_STILL_RANDOM_GPS){
+    startStillRandomGPS();
+    return;
+  }
+  if(!navigator.geolocation){toast('GPS not supported');return;}
+  navigator.geolocation.watchPosition(onPosition,function(e){
+    document.getElementById('gps-dot').classList.remove('active');
+    toast('GPS: '+e.message);
+  },{enableHighAccuracy:true,maximumAge:2000});
+}
+
+function startStillRandomGPS(){
+  fakeGpsPos=randomPointNear(FAKE_GPS_CENTER,FAKE_GPS_RADIUS_METRES);
+  showFakeGPSStatus('Fake GPS start');
+  console.log('Fake GPS start:', fakeGpsPos);
+  toast('Using still random GPS start');
+  onPosition({
+    coords:{
+      latitude:fakeGpsPos.lat,
+      longitude:fakeGpsPos.lng
+    }
+  });
+}
+
+function onPosition(pos){
+  const ll={lat:pos.coords.latitude,lng:pos.coords.longitude};
+  userPos=ll;
+  document.getElementById('gps-dot').classList.add('active');
+  if(!userMarker){
+    userMarker=L.marker(ll,{icon:fakeGpsIcon,draggable:USE_STILL_RANDOM_GPS,title:'Drag fake GPS point'}).addTo(map);
+    if(USE_STILL_RANDOM_GPS){
+      userMarker.on('drag',onFakeGPSDrag);
+      userMarker.on('dragend',onFakeGPSDrop);
+    }
+    map.setView(ll,15);
+  } else {
+    userMarker.setLatLng(ll);
+  }
+  if(routeSteps.length>0) updateNavStep();
+}
+
+function onFakeGPSDrag(e){
+  setManualFakeGPS(e.target.getLatLng(),false);
+}
+
+function onFakeGPSDrop(e){
+  setManualFakeGPS(e.target.getLatLng(),true);
+}
+
+function setManualFakeGPS(latlng,refreshRoute){
+  fakeGpsPos={lat:latlng.lat,lng:latlng.lng};
+  userPos=fakeGpsPos;
+  document.getElementById('gps-dot').classList.add('active');
+  if(destPos) showRoutePoints();
+  else showFakeGPSStatus('Fake GPS');
+  if(routeSteps.length>0) updateNavStep();
+  if(refreshRoute&&destPos){
+    if(routeRefreshTimer) clearTimeout(routeRefreshTimer);
+    routeRefreshTimer=setTimeout(fetchRoute,250);
+  }
+}
+
+// Destination
+function setDestination(latlng){
+  destPos=latlng;
+  if(destMarker) map.removeLayer(destMarker);
+  destMarker=L.marker(latlng).addTo(map);
+  if(userPos){
+    showRoutePoints();
+    fetchRoute();
+  }
+  else toast('Waiting for GPS...');
+}
+
+async function searchDestination(){
+  const q=document.getElementById('dest-input').value.trim();
+  if(!q) return;
+  toast('Searching...');
+  try{
+    const r=await fetch('https://nominatim.openstreetmap.org/search?format=json&q='+encodeURIComponent(q)+'&limit=1');
+    const data=await r.json();
+    if(!data.length){toast('Not found');return;}
+    const ll={lat:parseFloat(data[0].lat),lng:parseFloat(data[0].lon)};
+    setDestination(ll);
+    map.setView(ll,14);
+    document.getElementById('clear-btn').classList.add('visible');
+  } catch(e){toast('Search failed');}
+}
+
+// OSRM routing
+async function fetchRoute(){
+  if(!userPos||!destPos) return;
+  toast('Calculating route...');
+  try{
+    const url=OSRM_BASE+userPos.lng+','+userPos.lat+';'+destPos.lng+','+destPos.lat+'?overview=full&geometries=geojson&steps=true';
+    const r=await fetch(url);
+    const data=await r.json();
+    if(data.code!=='Ok'){toast('Route not found');return;}
+    const route=data.routes[0];
+    drawRoute(route.geometry.coordinates);
+    routeSteps=parseSteps(route.legs[0].steps);
+    currentStepIdx=0;
+    const dur=route.duration;
+    const eta=new Date(Date.now()+dur*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    document.getElementById('nav-eta').textContent='ETA '+eta;
+    document.getElementById('navbar').classList.add('visible');
+    document.getElementById('clear-btn').classList.add('visible');
+    toast('Route: '+fmtDist(route.distance));
+    updateNavStep();
+    if(navInterval) clearInterval(navInterval);
+    navInterval=setInterval(updateNavStep,3000);
+  } catch(e){toast('Routing error: '+e.message);}
+}
+
+function drawRoute(coords){
+  if(routeLine) map.removeLayer(routeLine);
+  const latlngs=coords.map(function(c){return[c[1],c[0]];});
+  routeLine=L.polyline(latlngs,{color:'#2a6eff',weight:5,opacity:0.8}).addTo(map);
+  map.fitBounds(routeLine.getBounds(),{padding:[40,40]});
+}
+
+function parseSteps(steps){
+  return steps.map(function(s){
+    const mod=s.maneuver.modifier||'';
+    const type=s.maneuver.type||'';
+    let turn=TURN_STRAIGHT;
+    if(type==='turn'||type==='fork'||type==='off ramp'){
+      if(mod==='left'||mod==='sharp left') turn=TURN_LEFT;
+      else if(mod==='right'||mod==='sharp right') turn=TURN_RIGHT;
+      else if(mod==='slight left') turn=TURN_SLIGHT_LEFT;
+      else if(mod==='slight right') turn=TURN_SLIGHT_RIGHT;
+      else if(mod==='uturn') turn=TURN_U_TURN;
+    }
+    return{turn:turn,distance:Math.round(s.distance),street:s.name||'Unnamed road',location:s.maneuver.location};
+  });
+}
+
+// Nav step tracking
+function updateNavStep(){
+  if(!routeSteps.length||!userPos) return;
+  var nearest=currentStepIdx, minDist=Infinity;
+  for(var i=currentStepIdx;i<Math.min(currentStepIdx+5,routeSteps.length);i++){
+    var s=routeSteps[i];
+    var d=haversine(userPos.lat,userPos.lng,s.location[1],s.location[0]);
+    if(d<minDist){minDist=d;nearest=i;}
+  }
+  if(minDist<30&&nearest+1<routeSteps.length) currentStepIdx=nearest+1;
+  var step=routeSteps[Math.min(currentStepIdx,routeSteps.length-1)];
+  renderNavBar(step);
+  sendNavBLE(step);
+}
+
+function renderNavBar(step){
+  document.getElementById('nav-arrow').innerHTML=TURN_ARROWS[step.turn];
+  document.getElementById('nav-dist').textContent=fmtDist(step.distance);
+  document.getElementById('nav-street').textContent=step.street;
+}
+
+// BLE packet: 6 bytes
+// byte 0   = turn (0-5 matching TurnDir enum)
+// byte 1-2 = distance metres uint16 big-endian
+// byte 3-5 = first 3 chars of street name ASCII (0x00 padded)
+async function sendNavBLE(step){
+  if(!bleChar) return;
+  try{
+    var buf=new Uint8Array(6);
+    buf[0]=step.turn&0xFF;
+    buf[1]=(step.distance>>8)&0xFF;
+    buf[2]=step.distance&0xFF;
+    var name=(step.street||'   ').substring(0,3).padEnd(3,' ');
+    buf[3]=name.charCodeAt(0)&0xFF;
+    buf[4]=name.charCodeAt(1)&0xFF;
+    buf[5]=name.charCodeAt(2)&0xFF;
+    await bleChar.writeValueWithoutResponse(buf);
+  } catch(e){ console.warn('BLE write:',e); }
+}
+
+// BLE connect/disconnect
+async function toggleBLE(){
+  if(bleDevice&&bleDevice.gatt.connected){bleDevice.gatt.disconnect();return;}
+  var btn=document.getElementById('ble-btn');
+  var status=document.getElementById('ble-status');
+  btn.textContent='Connecting...'; btn.className='';
+  try{
+    bleDevice=await navigator.bluetooth.requestDevice({
+      filters:[{name:'ESP32 Bike Control'}],
+      optionalServices:[NAV_SERVICE]
+    });
+    bleDevice.addEventListener('gattserverdisconnected',onBLEDisconnect);
+    var server=await bleDevice.gatt.connect();
+    var service=await server.getPrimaryService(NAV_SERVICE);
+    bleChar=await service.getCharacteristic(NAV_CHAR);
+    btn.textContent='Connected'; btn.className='connected';
+    status.textContent=bleDevice.name||'ESP32 Bike Control';
+    toast('BLE connected!');
+  } catch(e){
+    btn.textContent='Connect BLE'; btn.className='error';
+    status.textContent='Failed';
+    toast('BLE: '+(e.message||'failed'));
+    setTimeout(function(){btn.className='';},2000);
+  }
+}
+
+function onBLEDisconnect(){
+  bleChar=null;
+  document.getElementById('ble-btn').textContent='Connect BLE';
+  document.getElementById('ble-btn').className='';
+  document.getElementById('ble-status').textContent='Disconnected';
+  toast('BLE disconnected');
+}
+
+// Clear route
+function clearRoute(){
+  if(routeLine){map.removeLayer(routeLine);routeLine=null;}
+  if(destMarker){map.removeLayer(destMarker);destMarker=null;}
+  if(navInterval){clearInterval(navInterval);navInterval=null;}
+  routeSteps=[];currentStepIdx=0;destPos=null;
+  document.getElementById('navbar').classList.remove('visible');
+  document.getElementById('clear-btn').classList.remove('visible');
+  document.getElementById('dest-input').value='';
+}
+
+// Utilities
+function fmtDist(m){ return m>=1000?(m/1000).toFixed(1)+' km':Math.round(m)+' m'; }
+
+function haversine(lat1,lon1,lat2,lon2){
+  var R=6371000;
+  var dLat=(lat2-lat1)*Math.PI/180;
+  var dLon=(lon2-lon1)*Math.PI/180;
+  var a=Math.sin(dLat/2)*Math.sin(dLat/2)+
+        Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*
+        Math.sin(dLon/2)*Math.sin(dLon/2);
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+function randomPointNear(center,radiusMetres){
+  var angle=Math.random()*Math.PI*2;
+  var distance=Math.sqrt(Math.random())*radiusMetres;
+  var earthRadius=6371000;
+  var lat1=center.lat*Math.PI/180;
+  var lon1=center.lng*Math.PI/180;
+  var lat2=Math.asin(
+    Math.sin(lat1)*Math.cos(distance/earthRadius)+
+    Math.cos(lat1)*Math.sin(distance/earthRadius)*Math.cos(angle)
+  );
+  var lon2=lon1+Math.atan2(
+    Math.sin(angle)*Math.sin(distance/earthRadius)*Math.cos(lat1),
+    Math.cos(distance/earthRadius)-Math.sin(lat1)*Math.sin(lat2)
+  );
+  return{lat:lat2*180/Math.PI,lng:lon2*180/Math.PI};
+}
+
+function pointText(point){
+  return point.lat.toFixed(6)+', '+point.lng.toFixed(6);
+}
+
+function showFakeGPSStatus(label){
+  if(!fakeGpsPos) return;
+  document.getElementById('ble-status').textContent=label+': '+pointText(fakeGpsPos);
+}
+
+function showRoutePoints(){
+  if(!userPos||!destPos) return;
+  var msg='Start: '+pointText(userPos)+' | End: '+pointText(destPos);
+  document.getElementById('ble-status').textContent=msg;
+  console.log('Route points:',{start:userPos,end:destPos});
+}
+
+function toast(msg){
+  var t=document.getElementById('toast');
+  t.textContent=msg; t.classList.add('show');
+  setTimeout(function(){t.classList.remove('show');},2500);
+}
+
+// Start
+initMap();
+startGPS();
+
+// Check Web Bluetooth availability and warn if HTTP
+if (!navigator.bluetooth) {
+  var msg = location.protocol === 'http:'
+    ? 'Web Bluetooth needs HTTPS. See console for setup.'
+    : 'Web Bluetooth not supported in this browser.';
+  document.getElementById('ble-status').textContent = msg;
+  document.getElementById('ble-btn').disabled = true;
+  document.getElementById('ble-btn').style.opacity = '0.4';
+  toast(msg);
+  console.warn('Fix: run: python -m http.server 8080 then open via Chrome with --allow-insecure-localhost flag, OR use ngrok for HTTPS');
+}
+document.getElementById('dest-input').addEventListener('keydown',function(e){
+  if(e.key==='Enter') searchDestination();
+});
+</script>
+</body>
+</html>
